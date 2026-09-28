@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Синхронизация памяти: выгрузить свежие сессии агентов и обновить индекс QMD.
 
-  python3 sync.py              выгрузка всех новых сессий, qmd update, qmd embed
-  python3 sync.py --detach     то же в фоне, сразу вернуть управление (для хуков)
-  python3 sync.py --no-embed   без пересчёта векторов (быстро; поиск по словам уже свежий)
-  python3 sync.py --status     где лог, когда был последний прогон и чем кончился
+  python3 sync.py                      выгрузка новых сессий, qmd update, qmd embed
+  python3 sync.py --detach             то же в фоне, сразу вернуть управление (для хуков)
+  python3 sync.py --no-embed           без пересчёта векторов (быстро; поиск по словам свежий)
+  python3 sync.py --source hook|timer  кто запустил; пишется в лог и в last-run
+  python3 sync.py --status             где лог, когда был последний прогон и чем кончился
 
 Один и тот же скрипт зовут хук конца сессии агента и планировщик системы (launchd,
-systemd, Планировщик заданий Windows). Два прогона одновременно не идут: второй
-оставляет отметку «есть работа» и выходит, а первый перед завершением проходит ещё
-раз. Так событие не теряется и тяжёлый пересчёт векторов не запускается дважды.
+systemd, Планировщик заданий Windows). Два прогона одновременно не идут. Каждый запуск
+сначала оставляет отметку «есть работа», потом пробует взять замок. Кто взял, работает,
+пока отметка появляется снова, а после освобождения замка проверяет её ещё раз. Кто не
+взял, выходит: его отметку подхватит работающий. Замок держит сама система и снимает,
+когда процесс завершился, поэтому упавший прогон не оставляет брошенного замка.
 
 Пути и выгрузчики настраиваются переменными окружения:
   AGENT_MEMORY_DIR     корень выгрузок и состояния, по умолчанию ~/agent-memory
@@ -21,11 +24,11 @@ systemd, Планировщик заданий Windows). Два прогона �
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import shutil
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -36,8 +39,6 @@ LOG = STATE_DIR / "sync.log"
 LOCK = STATE_DIR / "sync.lock"
 PENDING = STATE_DIR / "pending"
 LAST = STATE_DIR / "last-run"
-# Замок старше этого срока считается брошенным упавшим прогоном.
-STALE_LOCK_SECONDS = 2 * 60 * 60
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_KEEP_LINES = 2000
 
@@ -50,8 +51,11 @@ EXPORTERS = {
 # добавляются в PATH дочерних процессов; лишние на этой машине просто не существуют.
 EXTRA_BIN_DIRS = [
     "~/.local/bin", "~/.bun/bin", "~/.npm-global/bin", "~/.volta/bin",
-    "/opt/homebrew/bin", "/usr/local/bin", "~/AppData/Roaming/npm",
+    "~/.local/share/fnm/aliases/default/bin", "/opt/homebrew/bin", "/usr/local/bin",
+    "~/AppData/Roaming/npm",
 ]
+# Версии Node под nvm лежат в каталогах с номером версии; берутся все, новые первыми.
+EXTRA_BIN_GLOBS = ["~/.nvm/versions/node/*/bin"]
 
 
 def log(message: str) -> None:
@@ -72,6 +76,8 @@ def rotate_log() -> None:
 def child_env() -> dict[str, str]:
     env = dict(os.environ)
     extra = [os.path.expanduser(p) for p in EXTRA_BIN_DIRS]
+    for pattern in EXTRA_BIN_GLOBS:
+        extra += sorted(glob.glob(os.path.expanduser(pattern)), reverse=True)
     qmd_bin = os.environ.get("QMD_BIN")
     if qmd_bin:
         extra.insert(0, str(Path(qmd_bin).expanduser().parent))
@@ -83,28 +89,40 @@ def child_env() -> dict[str, str]:
 def find_qmd(env: dict[str, str]) -> str | None:
     explicit = os.environ.get("QMD_BIN")
     if explicit:
-        return explicit if Path(explicit).expanduser().exists() else None
+        path = Path(explicit).expanduser()
+        return str(path) if path.exists() else None
     return shutil.which("qmd", path=env["PATH"])
 
 
-def acquire_lock() -> bool:
+def try_lock():
+    """Неблокирующий замок силами системы. Возвращает открытый файл или None, если занят."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    for _ in range(2):
-        try:
-            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"{os.getpid()} {time.time():.0f}\n".encode())
-            os.close(fd)
-            return True
-        except FileExistsError:
-            try:
-                age = time.time() - LOCK.stat().st_mtime
-            except OSError:
-                continue
-            if age < STALE_LOCK_SECONDS:
-                return False
-            log(f"снят брошенный замок возрастом {int(age)} с")
-            LOCK.unlink(missing_ok=True)
-    return False
+    handle = open(LOCK, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def release_lock(handle) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def run(cmd: list[str], env: dict[str, str], label: str) -> bool:
@@ -144,24 +162,30 @@ def one_pass(embed: bool) -> bool:
     return ok
 
 
-def sync(embed: bool) -> int:
+def sync(embed: bool, source: str) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     rotate_log()
-    if not acquire_lock():
-        PENDING.touch()
-        log("идёт другой прогон; отметка оставлена, он пройдёт ещё раз")
-        return 0
+    # Отметка ставится до попытки взять замок. Тогда работающий прогон либо увидит её
+    # в своём цикле, либо после освобождения замка, и событие не теряется.
+    PENDING.touch()
     ok = True
-    try:
-        # Отметка, оставленная во время прогона, значит, что после его начала закончилась
-        # ещё одна сессия. Три круга хватает, чтобы догнать пачку соседних событий.
-        for _ in range(3):
-            PENDING.unlink(missing_ok=True)
-            ok = one_pass(embed)
-            if not PENDING.exists():
-                break
-    finally:
-        LOCK.unlink(missing_ok=True)
-    LAST.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} {'ok' if ok else 'error'}\n", encoding="utf-8")
+    ran = False
+    while PENDING.exists():
+        handle = try_lock()
+        if handle is None:
+            if not ran:
+                log(f"source={source}: идёт другой прогон, он подхватит эту работу")
+            break
+        try:
+            while PENDING.exists():
+                PENDING.unlink(missing_ok=True)
+                log(f"START sync source={source}")
+                ok = one_pass(embed)
+                ran = True
+                LAST.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} source={source} "
+                                f"{'ok' if ok else 'error'}\n", encoding="utf-8")
+        finally:
+            release_lock(handle)
     return 0 if ok else 1
 
 
@@ -182,7 +206,10 @@ def status() -> int:
     print(f"каталог памяти: {MEMORY_DIR}")
     print(f"лог: {LOG}")
     print(f"последний прогон: {LAST.read_text(encoding='utf-8').strip() if LAST.exists() else 'не было'}")
-    print(f"идёт прогон: {'да' if LOCK.exists() else 'нет'}")
+    handle = try_lock()
+    if handle is not None:
+        release_lock(handle)
+    print(f"идёт прогон: {'нет' if handle is not None else 'да'}")
     qmd = find_qmd(child_env())
     print(f"qmd: {qmd or 'не найден (задай QMD_BIN)'}")
     for key, (_, folder) in EXPORTERS.items():
@@ -196,14 +223,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--detach", action="store_true", help="уйти в фон и сразу вернуть управление")
     parser.add_argument("--no-embed", action="store_true", help="не пересчитывать векторы")
+    parser.add_argument("--source", default="manual",
+                        help="кто запустил: hook, timer или manual; пишется в лог и в last-run")
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
     if args.status:
         return status()
     if args.detach:
         # Хук агента может передать JSON события на stdin; он не нужен, но и мешать не должен.
-        return detach(["--no-embed"] if args.no_embed else [])
-    return sync(embed=not args.no_embed)
+        return detach(["--source", args.source] + (["--no-embed"] if args.no_embed else []))
+    return sync(embed=not args.no_embed, source=args.source)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,31 @@ def is_ephemeral_cwd(cwd: object) -> bool:
     except OSError:
         return False
     return any(path == root or path.is_relative_to(root) for root in ephemeral_roots())
+
+
+# Секрет, вставленный в чат, иначе попал бы в выгрузку и в индекс. Паттерны те же, что
+# у секрет-гейта в .githooks/pre-commit. Это страховка, а не гарантия: ключ в
+# нестандартном формате паттерн не узнает.
+SECRET_PATTERN = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"
+    r"|BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|sk-(?:ant|proj|live|test)-[A-Za-z0-9_-]{20,}"
+    r"|xox[bap]-[A-Za-z0-9-]{10,}"
+    r"|gh[pousr]_[A-Za-z0-9]{30,}"
+    r"|github_pat_[A-Za-z0-9_]{30,}"
+    r"|AIza[0-9A-Za-z_-]{30,}",
+    re.DOTALL,
+)
+
+
+def redact(text: str) -> str:
+    return SECRET_PATTERN.sub("[СЕКРЕТ СКРЫТ]", text or "")
+
+
+def local_time(ts: datetime | None) -> datetime | None:
+    """Время записи в часовом поясе этой машины: сессию ищут по «вчера утром», а не по UTC."""
+    return ts.astimezone() if ts is not None and ts.tzinfo is not None else ts
 
 
 def yaml_quote(value: object) -> str:

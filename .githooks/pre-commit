@@ -1,23 +1,35 @@
 #!/usr/bin/env bash
 # Секрет-гейт: блокирует коммит, если в добавленных файлах найден паттерн секрета.
 # Включается один раз: git config core.hooksPath .githooks
+#
+# Поиск идёт командой git grep --cached прямо по содержимому индекса. Так имя файла
+# не проходит через экранирование (кириллица, пробелы, кавычки), а содержимое не
+# проходит через канал, который grep может закрыть раньше времени. Если проверка
+# не смогла выполниться, коммит блокируется: гейт отказывает в сомнительном случае.
+#
 # Проверка обязана уметь упасть: положи в файл фейковый ключ вида AKIA + 16 заглавных
 # букв и цифр, сделай git add и убедись, что коммит отклонён.
-set -uo pipefail
+set -u
 
 patterns='BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY|AKIA[0-9A-Z]{16}|sk-(ant|proj|live|test)-[A-Za-z0-9_-]{20,}|xox[bap]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AIza[0-9A-Za-z_-]{30,}|"private_key"'
 
-fail=0
-while IFS= read -r f; do
-    case "$f" in .githooks/*) continue;; esac  # сам гейт содержит паттерны, его не сканируем
-    if git show ":$f" 2>/dev/null | grep -qE "$patterns"; then
-        echo "СЕКРЕТ-ГЕЙТ: паттерн секрета в '$f', коммит заблокирован." >&2
-        fail=1
-    fi
-done < <(git diff --cached --name-only --diff-filter=ACM)
+files=()
+while IFS= read -r -d '' f; do
+    case "$f" in .githooks/*) ;; *) files+=("$f") ;; esac  # сам гейт содержит паттерны
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
 
-if [ "$fail" -ne 0 ]; then
-    echo "Убери секрет из файла и храни его в системном хранилище секретов." >&2
+[ "${#files[@]}" -eq 0 ] && exit 0
+
+found=$(git -c core.quotePath=false --literal-pathspecs grep --cached -l -E "$patterns" -- "${files[@]}")
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    echo "СЕКРЕТ-ГЕЙТ: паттерн секрета в файлах:" >&2
+    printf '%s\n' "$found" >&2
+    echo "Коммит заблокирован. Убери секрет из файла и храни его в системном хранилище секретов." >&2
+    exit 1
+fi
+if [ "$rc" -ne 1 ]; then
+    echo "СЕКРЕТ-ГЕЙТ: проверка не выполнилась (git grep, код $rc), коммит заблокирован." >&2
     exit 1
 fi
 exit 0

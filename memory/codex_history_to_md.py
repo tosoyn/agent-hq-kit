@@ -25,8 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from contract import (  # noqa: E402
-    contract_lines, is_ephemeral_cwd, is_fresh, project_key_from_cwd, project_name_from_cwd,
-    raw_exists, write_atomic, yaml_quote,
+    contract_lines, is_ephemeral_cwd, is_fresh, local_time, project_key_from_cwd,
+    project_name_from_cwd, raw_exists, redact, write_atomic, yaml_quote,
 )
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
@@ -57,8 +57,9 @@ SKIP_USER_PREFIXES = (
     "<codex_internal_context",
     "<user_instructions>",
     "# AGENTS.md instructions",
-    "[Request interrupted by user",
+    "<turn_aborted>",
 )
+INTERRUPT_MARK = "[ВЛАДЕЛЕЦ ПРЕРВАЛ РАБОТУ]"
 SERVICE_TAGS = re.compile(
     r"<(command-message|command-name|command-args|local-command-stdout"
     r"|local-command-caveat|system-reminder|task-notification)>.*?</\1>",
@@ -70,7 +71,7 @@ def parse_ts(value) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return local_time(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
     except ValueError:
         return None
 
@@ -82,7 +83,30 @@ def clean(text: str) -> str:
 
 def clean_user(text: str) -> str:
     cleaned = clean(SERVICE_TAGS.sub("", text or ""))
+    if cleaned.startswith("[Request interrupted by user"):
+        return INTERRUPT_MARK
     return "" if not cleaned or cleaned.startswith(SKIP_USER_PREFIXES) else cleaned
+
+
+def user_question(raw_args) -> str:
+    """Вопрос пользователю с вариантами из аргументов request_user_input.
+
+    Разбор сделан по описанию протокола Codex; в истории, на которой писался шаблон,
+    живых вызовов этого инструмента не было. Если формат другой, вопрос попадёт в
+    выгрузку сырым текстом аргументов, а не потеряется.
+    """
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+    except json.JSONDecodeError:
+        return f"[ВОПРОС ВЛАДЕЛЬЦУ] {' '.join(str(raw_args).split())[:1000]}"
+    lines = ["[ВОПРОС ВЛАДЕЛЬЦУ]"]
+    for q in (args or {}).get("questions") or []:
+        if not isinstance(q, dict):
+            continue
+        options = "; ".join(str(o.get("label", o)) if isinstance(o, dict) else str(o)
+                            for o in q.get("options") or [])
+        lines.append(f"  {q.get('question', '')}" + (f"\n  варианты: {options}" if options else ""))
+    return "\n".join(lines) if len(lines) > 1 else f"[ВОПРОС ВЛАДЕЛЬЦУ] {json.dumps(args, ensure_ascii=False)[:1000]}"
 
 
 def blocks_text(content, kinds: set[str], user: bool = False) -> str:
@@ -130,6 +154,9 @@ def parse_session(path: Path) -> dict:
     # Один и тот же запрос клиент пишет дважды: событием и сообщением. Счётчик гасит
     # копию, не трогая повтор, который пользователь действительно ввёл дважды.
     pending_user: Counter = Counter()
+    # Вопрос пользователю живёт в вызове инструмента, ответ в его результате: пара
+    # склеивается по call_id, иначе из истории пропадает выбор владельца.
+    pending_asks: dict[str, str] = {}
 
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -162,6 +189,8 @@ def parse_session(path: Path) -> dict:
                 elif payload.get("type") == "token_count":
                     usage = (payload.get("info") or {}).get("total_token_usage") or {}
                     tokens = max(tokens, int(usage.get("total_tokens", 0) or 0))
+                elif payload.get("type") == "turn_aborted" and payload.get("reason") == "interrupted":
+                    messages.append({"role": "user", "text": INTERRUPT_MARK, "ts": ts})
             elif kind == "response_item":
                 ptype, role = payload.get("type"), payload.get("role")
                 if ptype == "message" and role == "assistant":
@@ -175,14 +204,27 @@ def parse_session(path: Path) -> dict:
                     text = blocks_text(payload.get("content"), {"input_text", "text"}, user=True)
                     if text and pending_user[text] > 0:
                         pending_user[text] -= 1
-                    elif text:
+                    elif text and text != INTERRUPT_MARK:  # прерывание уже пришло событием
                         messages.append({"role": "user", "text": text, "ts": ts})
+                elif ptype in ("function_call_output", "custom_tool_call_output"):
+                    ask = pending_asks.pop(payload.get("call_id"), None)
+                    if ask:
+                        output = payload.get("output")
+                        output = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+                        messages.append({"role": "user", "ts": ts,
+                                         "text": f"{ask}\n[ОТВЕТ ВЛАДЕЛЬЦА] {' '.join(output.split())[:2000]}"})
                 elif ptype in ("function_call", "custom_tool_call"):
                     # Свежие версии Codex пишут вызовы как custom_tool_call с текстом
                     # в поле input вместо JSON в arguments.
                     name = payload.get("name", "tool")
                     tools[name] += 1
                     raw_args = payload.get("arguments", payload.get("input"))
+                    if name == "request_user_input":
+                        # Вопрос виден в ходе агента сразу, даже если ответа так и не было.
+                        question = user_question(raw_args)
+                        messages.append({"role": "assistant", "text": question, "ts": ts})
+                        pending_asks[payload.get("call_id")] = question
+                        continue
                     desc = tool_description(name, raw_args)
                     if desc and len(activity) < MAX_TOOL_ACTIVITY:
                         activity.append({"ts": ts, "name": name, "desc": desc})
@@ -211,7 +253,7 @@ def format_duration(seconds: int) -> str:
 
 
 def format_markdown(session: dict) -> str:
-    msgs = session["messages"]
+    msgs = [{**m, "text": redact(m["text"])} for m in session["messages"]]
     cwd = session["cwd"]
     project = project_name_from_cwd(cwd)
     first_user = next((m["text"] for m in msgs if m["role"] == "user"), "Codex session")
@@ -263,28 +305,29 @@ def format_markdown(session: dict) -> str:
         lines += ["## Инструменты", ""]
         for item in session["activity"]:
             stamp = item["ts"].strftime("%H:%M") if item["ts"] else "--:--"
-            lines.append(f"- [{stamp}] `{item['name']}`: {item['desc']}")
+            lines.append(f"- [{stamp}] `{item['name']}`: {redact(item['desc'])}")
         lines.append("")
     return "\n".join(lines)
 
 
-def export(path: Path, output: Path, *, force: bool = False, dry_run: bool = False) -> bool:
+def export(path: Path, output: Path, *, force: bool = False, dry_run: bool = False) -> str:
+    """Выгружает одну сессию. Итог: written, skipped (свежая, короткая или стенд) или error."""
     try:
         source_mtime_ns = path.stat().st_mtime_ns
         session = parse_session(path)
-    except OSError as exc:
-        print(f"  ошибка чтения {path}: {exc}", file=sys.stderr)
-        return False
-    if len(session["messages"]) < MIN_MESSAGES or is_ephemeral_cwd(session["cwd"]):
-        return False
-    target = output / project_key_from_cwd(session["cwd"]) / f"{path.stem}.md"
-    if not force and is_fresh(target, path):
-        return False
-    if dry_run:
-        print(f"  {path} -> {target}")
-        return True
-    write_atomic(target, format_markdown(session), source_mtime_ns)
-    return True
+        if len(session["messages"]) < MIN_MESSAGES or is_ephemeral_cwd(session["cwd"]):
+            return "skipped"
+        target = output / project_key_from_cwd(session["cwd"]) / f"{path.stem}.md"
+        if not force and is_fresh(target, path):
+            return "skipped"
+        if dry_run:
+            print(f"  {path} -> {target}")
+            return "written"
+        write_atomic(target, format_markdown(session), source_mtime_ns)
+    except (OSError, ValueError) as exc:
+        print(f"  ошибка {path}: {exc}", file=sys.stderr)
+        return "error"
+    return "written"
 
 
 def exported_mtimes(output: Path) -> dict[str, list[int]]:
@@ -318,9 +361,9 @@ def main() -> int:
         files = [f for f in files
                  if not (len(index.get(f.stem, [])) == 1 and index[f.stem][0] >= f.stat().st_mtime_ns)]
 
-    exported = sum(export(f, args.output, force=args.force, dry_run=args.dry_run) for f in files)
-    print(f"exported {exported} -> {args.output}")
-    return 0
+    results = Counter(export(f, args.output, force=args.force, dry_run=args.dry_run) for f in files)
+    print(f"exported {results['written']} -> {args.output}; errors {results['error']}")
+    return 1 if results["error"] else 0
 
 
 if __name__ == "__main__":

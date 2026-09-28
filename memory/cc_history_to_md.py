@@ -27,8 +27,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from contract import (  # noqa: E402
-    contract_lines, is_ephemeral_cwd, is_fresh, project_name_from_cwd, raw_exists, write_atomic,
-    yaml_quote,
+    contract_lines, is_ephemeral_cwd, is_fresh, local_time, project_name_from_cwd, raw_exists,
+    redact, write_atomic, yaml_quote,
 )
 
 
@@ -48,9 +48,6 @@ MIN_MESSAGES = 2
 # чтение из памяти; меньше — у длинного разбора теряется самая содержательная часть.
 # Обрезка честно помечается полем truncated, полный текст всегда остаётся в исходнике.
 MAX_ASSISTANT_CHARS = 12000
-# Очень большие транскрипты (обычно с картинками) в пакетном режиме пропускаются:
-# их разбор медленный. Режимы --last и --transcript этот предел не применяют.
-MAX_FILE_SIZE_MB = 15
 
 TAG_KEYWORDS = {
     "debug": ["ошибк", "error", "bug", "fix", "crash", "fail", "broken", "баг", "фикс"],
@@ -117,6 +114,7 @@ def parse_session(path: Path) -> dict:
 
     def add(role: str, text: str, ts) -> None:
         nonlocal truncated
+        text = redact(text)
         if role == "assistant" and len(text) > MAX_ASSISTANT_CHARS:
             truncated = True
             text = text[:MAX_ASSISTANT_CHARS] + "\n\n[...обрезано, полный текст в исходнике...]"
@@ -134,7 +132,7 @@ def parse_session(path: Path) -> dict:
             ts = None
             if record.get("timestamp"):
                 try:
-                    ts = datetime.fromisoformat(str(record["timestamp"]).replace("Z", "+00:00"))
+                    ts = local_time(datetime.fromisoformat(str(record["timestamp"]).replace("Z", "+00:00")))
                     first_ts = first_ts or ts
                     last_ts = ts
                 except ValueError:
@@ -285,25 +283,25 @@ def format_markdown(session: dict, project_key: str) -> str:
     return "\n".join(lines)
 
 
-def export(transcript: Path, output: Path, *, force: bool = False, dry_run: bool = False) -> bool:
-    """Выгружает одну сессию. True, если файл записан (или был бы записан в dry-run)."""
+def export(transcript: Path, output: Path, *, force: bool = False, dry_run: bool = False) -> str:
+    """Выгружает одну сессию. Итог: written, skipped (свежая, короткая или стенд) или error."""
     project_key = transcript.parent.name
     target = output / project_key / f"{transcript.stem}.md"
     if not force and is_fresh(target, transcript):
-        return False
+        return "skipped"
     try:
         source_mtime_ns = transcript.stat().st_mtime_ns
         session = parse_session(transcript)
-    except OSError as exc:
-        print(f"  ошибка чтения {transcript}: {exc}", file=sys.stderr)
-        return False
-    if len(session["messages"]) < MIN_MESSAGES or is_ephemeral_cwd(session["cwd"]):
-        return False
-    if dry_run:
-        print(f"  {transcript} -> {target}")
-        return True
-    write_atomic(target, format_markdown(session, project_key), source_mtime_ns)
-    return True
+        if len(session["messages"]) < MIN_MESSAGES or is_ephemeral_cwd(session["cwd"]):
+            return "skipped"
+        if dry_run:
+            print(f"  {transcript} -> {target}")
+            return "written"
+        write_atomic(target, format_markdown(session, project_key), source_mtime_ns)
+    except (OSError, ValueError) as exc:
+        print(f"  ошибка {transcript}: {exc}", file=sys.stderr)
+        return "error"
+    return "written"
 
 
 def all_transcripts() -> list[Path]:
@@ -332,14 +330,16 @@ def main() -> int:
         if args.last:
             targets = [max(transcripts, key=lambda p: p.stat().st_mtime)]
         else:
-            targets = [p for p in transcripts if p.stat().st_size <= MAX_FILE_SIZE_MB * 1024 * 1024]
+            targets = transcripts
             if args.since:
                 since = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
                 targets = [p for p in targets if p.stat().st_mtime >= since]
 
-    exported = sum(export(p, args.output, force=args.force, dry_run=args.dry_run) for p in sorted(targets))
-    print(f"exported {exported} -> {args.output}")
-    return 0
+    results = Counter(export(p, args.output, force=args.force, dry_run=args.dry_run) for p in sorted(targets))
+    print(f"exported {results['written']} -> {args.output}; errors {results['error']}")
+    # Ошибка чтения хотя бы одной сессии делает прогон неуспешным: иначе синхронизация
+    # отчитается «ok», а часть истории в память не попадёт.
+    return 1 if results["error"] else 0
 
 
 if __name__ == "__main__":
